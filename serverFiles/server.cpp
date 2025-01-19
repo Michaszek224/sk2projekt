@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <iostream>
 #include <unordered_map>
+#include <vector>
 
 #define PORT 8080
 #define MAX_CONNECTIONS 10
@@ -15,13 +16,34 @@
 
 using namespace std;
 
+// Structure to hold user information
+struct User {
+    int fd;
+    string username;
+    int score;
+};
+
+// Structure to hold quiz data
+struct Quiz {
+    int port;
+    string code;
+    vector<string> questions;
+    vector<vector<string>> answers;  // Multiple choices per question
+    vector<int> correct_answers;
+    vector<User> participants;
+};
+
+// Global map to hold quiz codes to their associated ports and quizzes
+unordered_map<string, Quiz> active_quizzes;
+unordered_map<string, int> quiz_codes_to_ports;
+
 void handle_client(int client_fd);
 void *client_thread(void *arg);
 void create_quiz(int client_fd);
 void generate_quiz_code(char* code);
-
-// Global variable to hold quiz codes and their associated ports
-unordered_map<string, int> quiz_codes_to_ports;
+void join_quiz(int client_fd, const char* code);
+void send_question_to_participants(const string& quiz_code, int question_index);
+void handle_answer(int client_fd, int quiz_port, int question_index, int answer);
 
 int main() {
     int server_fd, new_socket;
@@ -74,26 +96,25 @@ void *client_thread(void *arg) {
     int client_fd = *((int *)arg);
     char buffer[1024];
     int n;
+    char username[50];
+    
+    // Receive and handle client commands
+    send(client_fd, "Enter your username: ", 21, 0);
+    n = recv(client_fd, username, sizeof(username), 0);
+    username[n - 1] = '\0';  // Remove newline character
+    
+    cout << "Username: " << username << endl;
 
     // Receive and handle client commands
     while ((n = recv(client_fd, buffer, sizeof(buffer), 0)) > 0) {
         buffer[n] = '\0';
-        
+
         if (strncmp(buffer, "CREATE", 6) == 0) {
             create_quiz(client_fd);  // Trigger quiz creation and return code
         } else if (strncmp(buffer, "JOIN", 4) == 0) {
-            // Join the quiz (validate code and provide corresponding port)
             char code[CODE_LENGTH + 1];
             sscanf(buffer + 5, "%s", code);  // Assuming JOIN <code>
-            
-            if (quiz_codes_to_ports.find(code) != quiz_codes_to_ports.end()) {
-                int quiz_port = quiz_codes_to_ports[code];
-                char message[100];
-                sprintf(message, "Joining quiz on port %d\n", quiz_port);
-                send(client_fd, message, strlen(message), 0);
-            } else {
-                send(client_fd, "Invalid quiz code\n", 18, 0);
-            }
+            join_quiz(client_fd, code);      // Validate code and provide corresponding port
         } else {
             send(client_fd, "Invalid command\n", 16, 0);
         }
@@ -103,7 +124,6 @@ void *client_thread(void *arg) {
     return NULL;
 }
 
-// Function to create a quiz on another port and return a unique quiz code
 void create_quiz(int client_fd) {
     static int quiz_count = 0;
     if (quiz_count >= MAX_QUIZZES) {
@@ -115,19 +135,21 @@ void create_quiz(int client_fd) {
     char quiz_code[CODE_LENGTH + 1];
     generate_quiz_code(quiz_code);
 
-    // Assign a dynamic port for this quiz
-    int quiz_port = PORT + 1 + quiz_count;
+    // Assign a new `Quiz` object
+    Quiz new_quiz;
+    new_quiz.port = PORT + 1 + quiz_count; // Port calculation remains the same
     quiz_count++;
 
-    // Store the quiz code and its corresponding port
-    quiz_codes_to_ports[quiz_code] = quiz_port;
+    // Store the quiz using the quiz code as the key
+    active_quizzes[quiz_code] = new_quiz;
+    quiz_codes_to_ports[quiz_code] = new_quiz.port;
 
     // Send the quiz code to the client
-    char message[50];
+    char message[100];
     sprintf(message, "Quiz created! Use this code to join: %s\n", quiz_code);
     send(client_fd, message, strlen(message), 0);
-    
-    printf("Quiz created with code %s on port %d\n", quiz_code, quiz_port);
+
+    printf("Quiz created with code %s on port %d\n", quiz_code, new_quiz.port);
 }
 
 // Function to generate a random quiz code
@@ -138,3 +160,79 @@ void generate_quiz_code(char* code) {
     }
     code[CODE_LENGTH] = '\0';  // Null terminate the string
 }
+
+// Function to join a quiz with a given code
+void join_quiz(int client_fd, const char* code) {
+    string quiz_code_str(code);
+    if (active_quizzes.find(quiz_code_str) != active_quizzes.end()) {
+        // Assign the user to the quiz
+        char message[100];
+        sprintf(message, "Joining quiz with code: %s\n", code);
+        send(client_fd, message, strlen(message), 0);
+
+        // Add the user to the quiz participants
+        User new_user;
+        new_user.fd = client_fd;
+        active_quizzes[quiz_code_str].participants.push_back(new_user);
+
+        // Start the quiz for the user
+        send_question_to_participants(quiz_code_str, 0);  // Send the first question
+    } else {
+        send(client_fd, "Invalid quiz code\n", 18, 0);
+    }
+}
+
+// Function to send a question to all quiz participants
+void send_question_to_participants(const string& quiz_code, int question_index) {
+    Quiz& quiz = active_quizzes[quiz_code];
+
+    // Construct question message
+    string question = quiz.questions[question_index];
+    string answers = "";
+    for (const auto& ans : quiz.answers[question_index]) {
+        answers += ans + "\n";
+    }
+
+    if (!answers.empty()) {
+        answers.pop_back(); // Remove the last newline
+    }
+
+    // Send the question to all participants
+    for (const auto& participant : quiz.participants) {
+        if (send(participant.fd, question.c_str(), question.size(), 0) == -1) {
+            perror("Send question failed");
+        }
+        if (send(participant.fd, answers.c_str(), answers.size(), 0) == -1) {
+            perror("Send answers failed");
+        }
+    }
+}
+
+// Function to handle answer submission
+void handle_answer(int client_fd, int question_index, int answer, const string& quiz_code) {
+    auto it = active_quizzes.find(quiz_code);
+    if (it == active_quizzes.end()) {
+        send(client_fd, "Quiz not found.\n", 16, 0);
+        return;
+    }
+
+    Quiz& quiz = it->second;
+
+    if (answer == quiz.correct_answers[question_index]) {
+        // Correct answer handling
+        if (send(client_fd, "Correct answer!\n", 16, 0) == -1) {
+            perror("Send correct answer failed");
+        }
+        for (auto& participant : quiz.participants) {
+            if (participant.fd == client_fd) {
+                participant.score++;  // Increment user's score
+            }
+        }
+    } else {
+        // Incorrect answer handling
+        if (send(client_fd, "Incorrect answer.\n", 18, 0) == -1) {
+            perror("Send incorrect answer failed");
+        }
+    }
+}
+
