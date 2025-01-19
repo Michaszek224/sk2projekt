@@ -16,6 +16,9 @@
 
 using namespace std;
 
+// Mutex for thread-safe access to shared data
+pthread_mutex_t quiz_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // Structure to hold user information
 struct User {
     int fd;
@@ -33,17 +36,17 @@ struct Quiz {
     vector<User> participants;
 };
 
-// Global map to hold quiz codes to their associated ports and quizzes
+// Global maps to hold quizzes
 unordered_map<string, Quiz> active_quizzes;
 unordered_map<string, int> quiz_codes_to_ports;
 
+// Function prototypes
 void handle_client(int client_fd);
 void *client_thread(void *arg);
 void create_quiz(int client_fd);
 void generate_quiz_code(char* code);
 void join_quiz(int client_fd, const char* code);
 void send_question_to_participants(const string& quiz_code, int question_index);
-void handle_answer(int client_fd, int quiz_port, int question_index, int answer);
 
 int main() {
     int server_fd, new_socket;
@@ -72,6 +75,7 @@ int main() {
     }
 
     printf("Server is listening on port %d\n", PORT);
+    
 
     // Main server loop
     while (1) {
@@ -85,36 +89,39 @@ int main() {
         if (pthread_create(&thread_id, NULL, client_thread, (void *)&new_socket) != 0) {
             perror("Thread creation failed");
         }
-        cout << "Thread created" << endl;
+        pthread_detach(thread_id);  // Detach the thread to free resources automatically
     }
 
     return 0;
 }
 
-// Client handling in a separate thread
 void *client_thread(void *arg) {
     int client_fd = *((int *)arg);
     char buffer[1024];
     int n;
-    char username[50];
-    
-    // Receive and handle client commands
+    string username;
+
+    // Receive username
     send(client_fd, "Enter your username: ", 21, 0);
-    n = recv(client_fd, username, sizeof(username), 0);
-    username[n - 1] = '\0';  // Remove newline character
-    
+    n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    if (n <= 0) {
+        close(client_fd);
+        return NULL;
+    }
+    buffer[n] = '\0';
+    username = string(buffer);
+
     cout << "Username: " << username << endl;
+    send(client_fd, "Write CREATE to create a quiz or JOIN to join a quiz\n", 54, 0);
 
-    // Receive and handle client commands
-    while ((n = recv(client_fd, buffer, sizeof(buffer), 0)) > 0) {
+    while ((n = recv(client_fd, buffer, sizeof(buffer) - 1, 0)) > 0) {
         buffer[n] = '\0';
-
         if (strncmp(buffer, "CREATE", 6) == 0) {
-            create_quiz(client_fd);  // Trigger quiz creation and return code
+            create_quiz(client_fd);
         } else if (strncmp(buffer, "JOIN", 4) == 0) {
             char code[CODE_LENGTH + 1];
-            sscanf(buffer + 5, "%s", code);  // Assuming JOIN <code>
-            join_quiz(client_fd, code);      // Validate code and provide corresponding port
+            sscanf(buffer + 5, "%s", code);  // Extract quiz code
+            join_quiz(client_fd, code);
         } else {
             send(client_fd, "Invalid command\n", 16, 0);
         }
@@ -135,16 +142,22 @@ void create_quiz(int client_fd) {
     char quiz_code[CODE_LENGTH + 1];
     generate_quiz_code(quiz_code);
 
-    // Assign a new `Quiz` object
-    Quiz new_quiz;
-    new_quiz.port = PORT + 1 + quiz_count; // Port calculation remains the same
-    quiz_count++;
+    pthread_mutex_lock(&quiz_mutex);
 
-    // Store the quiz using the quiz code as the key
+    // Create and populate a new quiz
+    Quiz new_quiz;
+    new_quiz.port = PORT + 1 + quiz_count;
+    new_quiz.code = quiz_code;
+    new_quiz.questions = {"What is 2 + 2?", "What is the capital of France?"};
+    new_quiz.answers = {{"1. 3", "2. 4", "3. 5"}, {"1. Paris", "2. London", "3. Berlin"}};
+    new_quiz.correct_answers = {1, 0};  // Index of correct answers
+
     active_quizzes[quiz_code] = new_quiz;
     quiz_codes_to_ports[quiz_code] = new_quiz.port;
+    quiz_count++;
 
-    // Send the quiz code to the client
+    pthread_mutex_unlock(&quiz_mutex);
+
     char message[100];
     sprintf(message, "Quiz created! Use this code to join: %s\n", quiz_code);
     send(client_fd, message, strlen(message), 0);
@@ -152,7 +165,6 @@ void create_quiz(int client_fd) {
     printf("Quiz created with code %s on port %d\n", quiz_code, new_quiz.port);
 }
 
-// Function to generate a random quiz code
 void generate_quiz_code(char* code) {
     const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     for (int i = 0; i < CODE_LENGTH; ++i) {
@@ -161,78 +173,44 @@ void generate_quiz_code(char* code) {
     code[CODE_LENGTH] = '\0';  // Null terminate the string
 }
 
-// Function to join a quiz with a given code
 void join_quiz(int client_fd, const char* code) {
-    string quiz_code_str(code);
-    if (active_quizzes.find(quiz_code_str) != active_quizzes.end()) {
-        // Assign the user to the quiz
-        char message[100];
-        sprintf(message, "Joining quiz with code: %s\n", code);
-        send(client_fd, message, strlen(message), 0);
-
-        // Add the user to the quiz participants
-        User new_user;
-        new_user.fd = client_fd;
-        active_quizzes[quiz_code_str].participants.push_back(new_user);
-
-        // Start the quiz for the user
-        send_question_to_participants(quiz_code_str, 0);  // Send the first question
-    } else {
+    pthread_mutex_lock(&quiz_mutex);
+    auto it = active_quizzes.find(code);
+    if (it == active_quizzes.end()) {
         send(client_fd, "Invalid quiz code\n", 18, 0);
+        pthread_mutex_unlock(&quiz_mutex);
+        return;
     }
+
+    Quiz& quiz = it->second;
+    User new_user = {client_fd, "Anonymous", 0};
+    quiz.participants.push_back(new_user);
+
+    pthread_mutex_unlock(&quiz_mutex);
+
+    send(client_fd, "You joined the quiz!\n", 21, 0);
+    send_question_to_participants(code, 0);
 }
 
-// Function to send a question to all quiz participants
 void send_question_to_participants(const string& quiz_code, int question_index) {
-    Quiz& quiz = active_quizzes[quiz_code];
+    pthread_mutex_lock(&quiz_mutex);
+    auto it = active_quizzes.find(quiz_code);
+    if (it == active_quizzes.end() || question_index >= it->second.questions.size()) {
+        pthread_mutex_unlock(&quiz_mutex);
+        return;
+    }
 
-    // Construct question message
+    Quiz& quiz = it->second;
     string question = quiz.questions[question_index];
     string answers = "";
     for (const auto& ans : quiz.answers[question_index]) {
         answers += ans + "\n";
     }
 
-    if (!answers.empty()) {
-        answers.pop_back(); // Remove the last newline
+    for (auto& participant : quiz.participants) {
+        send(participant.fd, question.c_str(), question.size(), 0);
+        send(participant.fd, answers.c_str(), answers.size(), 0);
     }
 
-    // Send the question to all participants
-    for (const auto& participant : quiz.participants) {
-        if (send(participant.fd, question.c_str(), question.size(), 0) == -1) {
-            perror("Send question failed");
-        }
-        if (send(participant.fd, answers.c_str(), answers.size(), 0) == -1) {
-            perror("Send answers failed");
-        }
-    }
+    pthread_mutex_unlock(&quiz_mutex);
 }
-
-// Function to handle answer submission
-void handle_answer(int client_fd, int question_index, int answer, const string& quiz_code) {
-    auto it = active_quizzes.find(quiz_code);
-    if (it == active_quizzes.end()) {
-        send(client_fd, "Quiz not found.\n", 16, 0);
-        return;
-    }
-
-    Quiz& quiz = it->second;
-
-    if (answer == quiz.correct_answers[question_index]) {
-        // Correct answer handling
-        if (send(client_fd, "Correct answer!\n", 16, 0) == -1) {
-            perror("Send correct answer failed");
-        }
-        for (auto& participant : quiz.participants) {
-            if (participant.fd == client_fd) {
-                participant.score++;  // Increment user's score
-            }
-        }
-    } else {
-        // Incorrect answer handling
-        if (send(client_fd, "Incorrect answer.\n", 18, 0) == -1) {
-            perror("Send incorrect answer failed");
-        }
-    }
-}
-
